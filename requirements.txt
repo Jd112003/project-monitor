@@ -1,0 +1,4 @@
+# Project Monitor - Dependencies
+# Sistema de monitoreo de recursos del sistema
+
+psutil>=5.9.0
