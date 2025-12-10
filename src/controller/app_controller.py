@@ -13,9 +13,6 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional, Callable
 from collections import deque
 
-# Importar módulos del modelo
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model.system_data import SystemData
 from model.process_manager import ProcessManager
 from controller.thread_manager import ThreadManager
@@ -32,19 +29,39 @@ class AppController:
     """
     
     # Constantes
-    UPDATE_INTERVAL = 2.0  # Intervalo de actualización en segundos
-    HISTORY_DURATION = 3600  # Duración del historial en segundos (1 hora)
-    MAX_HISTORY_ENTRIES = HISTORY_DURATION // int(UPDATE_INTERVAL)  # ~1800 entradas
+    DEFAULT_UPDATE_INTERVAL = 2.0  # Intervalo de actualización en segundos
+    DEFAULT_HISTORY_DURATION = 3600  # Duración del historial en segundos (1 hora)
     
-    def __init__(self):
+    def __init__(self, update_interval: Optional[float] = None, history_duration: Optional[int] = None, config: Optional[Dict[str, Any]] = None):
         """
         Inicializa el controlador de la aplicación.
         
         Instancia los componentes del modelo y el gestor de hilos.
         """
+        self._config = config or {}
+        self.UPDATE_INTERVAL = update_interval or self.DEFAULT_UPDATE_INTERVAL
+        self.HISTORY_DURATION = history_duration or self.DEFAULT_HISTORY_DURATION
+        self.MAX_HISTORY_ENTRIES = max(1, int(self.HISTORY_DURATION // max(0.5, self.UPDATE_INTERVAL)))
+
         # Instanciar componentes del Modelo
         self._system_data = SystemData()
         self._process_manager = ProcessManager()
+        # Módulos extendidos
+        from model.sensors import SensorsReader
+        from model.gpu_manager import GPUManager
+        from model.power_manager import PowerManager
+        from model.fan_manager import FanManager
+        from model.rgb_manager import RGBManager
+        from model.app_profiles import AppProfiles
+
+        self._sensors = SensorsReader()
+        self._gpu_manager = GPUManager()
+        self._power_manager = PowerManager(config=self._config)
+        self._fan_manager = FanManager()
+        self._rgb_manager = RGBManager()
+        self._profiles = AppProfiles(self._power_manager, self._fan_manager, self._config.get("profiles", {}))
+        from model.msi_ec_manager import MsiEcManager
+        self._msi_ec_manager = MsiEcManager(use_pkexec=self._config.get("use_pkexec", False))
         
         # Instanciar el gestor de hilos
         self._thread_manager = ThreadManager()
@@ -264,6 +281,13 @@ class AppController:
             Lista con el historial de métricas (hasta 1 hora).
         """
         return list(self._metrics_history)
+
+    def get_storage_snapshot(self) -> Dict[str, Any]:
+        """
+        Obtiene una lectura puntual de almacenamiento/fragmentación.
+        Útil para refrescar la pestaña de fragmentación bajo demanda.
+        """
+        return self._system_data.get_storage_metrics()
     
     def get_process_list(self, **kwargs) -> List[Dict[str, Any]]:
         """
@@ -276,6 +300,100 @@ class AppController:
             Lista de procesos.
         """
         return self._process_manager.get_process_list(**kwargs)
+
+    # ---- Extensiones estilo Dragon Center ----
+    def get_temperatures(self) -> Dict[str, Any]:
+        return self._sensors.get_temperatures()
+
+    def get_fans(self) -> List[Dict[str, Any]]:
+        return self._fan_manager.list_fans()
+
+    def set_fan_pwm(self, pwm_path: str, value: int) -> Dict[str, Any]:
+        return self._fan_manager.set_pwm(pwm_path, value)
+
+    def get_gpu_info(self) -> List[Dict[str, Any]]:
+        return self._gpu_manager.get_gpu_info()
+
+    def get_power_state(self) -> Dict[str, Any]:
+        state = self._power_manager.get_governors()
+        state["profiles"] = self._config.get("power_profiles", {})
+        return state
+
+    def set_power_profile(self, name: str) -> Dict[str, Any]:
+        profiles = self._config.get("power_profiles", {})
+        cfg = profiles.get(name)
+        if not cfg:
+            return {"success": False, "message": f"Perfil '{name}' no existe"}
+        messages = []
+        success = True
+        if "governor" in cfg:
+            res = self._power_manager.set_governor(cfg["governor"])
+            messages.append(res.get("message", ""))
+            success = success and res.get("success", False)
+        if "max_freq_khz" in cfg:
+            res = self._power_manager.set_max_freq(int(cfg["max_freq_khz"]))
+            messages.append(res.get("message", ""))
+            success = success and res.get("success", False)
+        return {"success": success, "message": " | ".join([m for m in messages if m])}
+
+    def get_battery_info(self) -> Dict[str, Any]:
+        try:
+            import psutil
+            bat = psutil.sensors_battery()
+            if not bat:
+                return {}
+            return {
+                "percent": bat.percent,
+                "plugged": bat.power_plugged,
+                "secs_left": bat.secsleft,
+            }
+        except Exception:
+            return {}
+
+    def rgb_available(self) -> bool:
+        return self._config.get("rgb_enabled", False) and self._rgb_manager.is_available()
+
+    def set_rgb_preset(self, preset: str) -> Dict[str, Any]:
+        if not self._config.get("rgb_enabled", False):
+            return {"success": False, "message": "RGB deshabilitado en config"}
+        return self._rgb_manager.set_preset(preset)
+
+    def available_app_profiles(self) -> List[str]:
+        return self._profiles.available_profiles()
+
+    def apply_app_profile(self, name: str) -> Dict[str, Any]:
+        return self._profiles.apply_profile(name)
+
+    # MSI EC
+    def get_msi_ec_info(self) -> Dict[str, Any]:
+        return self._msi_ec_manager.get_info()
+
+    def set_msi_fan_mode(self, mode: str) -> Dict[str, Any]:
+        return self._msi_ec_manager.set_fan_mode(mode)
+
+    def set_msi_shift_mode(self, mode: str) -> Dict[str, Any]:
+        return self._msi_ec_manager.set_shift_mode(mode)
+
+    def set_msi_cooler_boost(self, value: str) -> Dict[str, Any]:
+        return self._msi_ec_manager.set_cooler_boost(value)
+
+    def set_msi_battery_thresholds(self, start: Optional[int], end: Optional[int]) -> Dict[str, Any]:
+        return self._msi_ec_manager.set_battery_thresholds(start, end)
+
+    def set_msi_webcam(self, enable: bool) -> Dict[str, Any]:
+        return self._msi_ec_manager.set_webcam(enable)
+
+    def set_msi_webcam_block(self, enable: bool) -> Dict[str, Any]:
+        return self._msi_ec_manager.set_webcam_block(enable)
+
+    def get_msi_battery_info(self) -> Dict[str, Any]:
+        return self._msi_ec_manager.get_battery_info()
+
+    def set_keyboard_backlight(self, level: int) -> Dict[str, Any]:
+        return self._msi_ec_manager.set_keyboard_backlight(level)
+
+    def get_keyboard_backlight(self) -> str:
+        return self._msi_ec_manager.get_keyboard_backlight()
     
     def kill_process(self, pid: int, force: bool = False) -> Dict[str, Any]:
         """

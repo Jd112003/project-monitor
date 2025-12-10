@@ -54,10 +54,15 @@ class ProcessManager:
         # Iterar sobre todos los procesos
         for proc in psutil.process_iter(['pid', 'name', 'status', 'memory_percent', 
                                           'cpu_percent', 'username', 'create_time',
-                                          'num_threads']):
+                                          'num_threads', 'memory_info']):
             try:
                 # Obtener información del proceso
                 proc_info = proc.info
+                io_counters = None
+                try:
+                    io_counters = proc.io_counters()
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    io_counters = None
                 
                 process_data = {
                     'pid': proc_info['pid'],
@@ -67,7 +72,11 @@ class ProcessManager:
                     'cpu_percent': round(proc_info['cpu_percent'] or 0, 2),
                     'username': proc_info['username'] or 'Unknown',
                     'create_time': proc_info['create_time'],
-                    'num_threads': proc_info['num_threads'] or 0
+                    'num_threads': proc_info['num_threads'] or 0,
+                    'rss_bytes': proc_info.get('memory_info').rss if proc_info.get('memory_info') else 0,
+                    'vms_bytes': proc_info.get('memory_info').vms if proc_info.get('memory_info') else 0,
+                    'io_read_bytes': io_counters.read_bytes if io_counters else 0,
+                    'io_write_bytes': io_counters.write_bytes if io_counters else 0,
                 }
                 
                 processes.append(process_data)

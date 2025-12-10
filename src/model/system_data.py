@@ -9,7 +9,8 @@ Autor: Project Monitor Team
 
 import psutil
 import time
-from typing import Dict, List, Any
+import subprocess
+from typing import Dict, List, Any, Optional
 
 
 class SystemData:
@@ -23,15 +24,18 @@ class SystemData:
     - Red (bytes enviados y recibidos)
     """
     
+    FRAG_CACHE_TTL = 600  # segundos para reutilizar cálculo de fragmentación de disco
+    
     def __init__(self):
         """
         Inicializa la clase SystemData.
         
-        Guarda los valores iniciales de red para calcular deltas.
+        Guarda los valores iniciales de red para calcular deltas y caches internos.
         """
         # Almacenar valores iniciales de red para calcular diferencias
         self._last_net_io = psutil.net_io_counters()
         self._last_net_time = time.time()
+        self._disk_frag_cache: Dict[str, Dict[str, Any]] = {}
     
     def get_cpu_metrics(self) -> Dict[str, Any]:
         """
@@ -74,38 +78,14 @@ class SystemData:
                 - fragmentation: Índice de fragmentación (simulado)
         """
         memory = psutil.virtual_memory()
-        
-        # ============================================================
-        # FRAGMENTACIÓN DE RAM - INTEGRACIÓN CON /proc EN LINUX
-        # ============================================================
-        # En Linux, la fragmentación de RAM se puede obtener de:
-        # /proc/buddyinfo - Información del buddy allocator
-        # /proc/pagetypeinfo - Información detallada de tipos de página
-        #
-        # Ejemplo de implementación para Linux:
-        # def _get_ram_fragmentation_linux():
-        #     try:
-        #         with open('/proc/buddyinfo', 'r') as f:
-        #             # Parsear buddyinfo para calcular índice de fragmentación
-        #             # Analizar la distribución de bloques libres
-        #             pass
-        #     except FileNotFoundError:
-        #         return None
-        #
-        # El índice de fragmentación puede calcularse como:
-        # fragmentation_index = 1 - (bloques_grandes_libres / total_bloques_libres)
-        # Valor entre 0 (sin fragmentación) y 1 (alta fragmentación)
-        # ============================================================
-        
-        # Valor simulado de fragmentación (reemplazar con lógica real)
-        fragmentation_simulated = 0.15  # 15% de fragmentación simulada
+        fragmentation = self._get_ram_fragmentation_linux()
         
         return {
             'total': memory.total,
             'available': memory.available,
             'used': memory.used,
             'percent': memory.percent,
-            'fragmentation': fragmentation_simulated,
+            'fragmentation': fragmentation,
             # Datos adicionales útiles
             'buffers': getattr(memory, 'buffers', 0),
             'cached': getattr(memory, 'cached', 0),
@@ -131,34 +111,7 @@ class SystemData:
             try:
                 usage = psutil.disk_usage(partition.mountpoint)
                 
-                # ============================================================
-                # FRAGMENTACIÓN DE DISCO - INTEGRACIÓN CON HERRAMIENTAS LINUX
-                # ============================================================
-                # En Linux, la fragmentación de disco se puede obtener usando:
-                # - e4defrag -c /mountpoint (para ext4)
-                # - filefrag -v /path/to/file
-                # - /proc/fs/ext4/<device>/mb_groups (para ext4)
-                #
-                # Ejemplo de implementación para Linux (ext4):
-                # import subprocess
-                # def _get_disk_fragmentation_linux(mountpoint):
-                #     try:
-                #         result = subprocess.run(
-                #             ['e4defrag', '-c', mountpoint],
-                #             capture_output=True, text=True, timeout=30
-                #         )
-                #         # Parsear salida para obtener índice de fragmentación
-                #         # Buscar línea con "fragmentation score"
-                #         pass
-                #     except Exception:
-                #         return None
-                #
-                # También se puede usar 'dumpe2fs' para obtener estadísticas
-                # del sistema de archivos y calcular fragmentación.
-                # ============================================================
-                
-                # Valor simulado de fragmentación de disco
-                fragmentation_simulated = 0.08  # 8% de fragmentación simulada
+                fragmentation = self._get_disk_fragmentation_linux(partition.mountpoint, partition.fstype)
                 
                 partition_data = {
                     'device': partition.device,
@@ -168,7 +121,7 @@ class SystemData:
                     'used': usage.used,
                     'free': usage.free,
                     'percent': usage.percent,
-                    'fragmentation': fragmentation_simulated
+                    'fragmentation': fragmentation
                 }
                 
                 partitions_info.append(partition_data)
@@ -250,3 +203,80 @@ class SystemData:
             'network': self.get_network_metrics(),
             'timestamp': time.time()
         }
+
+    def _get_ram_fragmentation_linux(self) -> Optional[float]:
+        """
+        Calcula un índice simple de fragmentación de RAM a partir de /proc/buddyinfo.
+        Valor entre 0 (sin fragmentación) y 1 (alta fragmentación). None si no aplica.
+        """
+        try:
+            with open("/proc/buddyinfo", "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+
+        total_pages = 0
+        largest_block_pages = 0
+
+        for line in lines:
+            parts = line.strip().split()
+            # Formato: Node 0, zone   DMA  1 2 3 4 ... (contadores por orden)
+            counts = [int(x) for x in parts[4:]]  # los primeros 4 tokens son cabecera
+            for order, count in enumerate(counts):
+                pages = (2 ** order)
+                total_pages += count * pages
+                if count > 0:
+                    largest_block_pages = max(largest_block_pages, pages)
+
+        if total_pages == 0:
+            return None
+
+        fragmentation_index = 1.0 - (largest_block_pages / total_pages)
+        return max(0.0, min(fragmentation_index, 1.0))
+
+    def _get_disk_fragmentation_linux(self, mountpoint: str, fstype: str) -> Optional[float]:
+        """
+        Intenta obtener un puntaje de fragmentación para sistemas ext basados en e4defrag.
+        Devuelve None si no es soportado o si falla la medición.
+        """
+        # Cachear resultados para evitar costo en cada lectura
+        cached = self._disk_frag_cache.get(mountpoint)
+        now = time.time()
+        if cached and (now - cached.get("ts", 0) < self.FRAG_CACHE_TTL):
+            return cached.get("value")
+
+        if not fstype.startswith("ext"):
+            return None
+
+        try:
+            result = subprocess.run(
+                ["e4defrag", "-c", mountpoint],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            output = result.stdout or result.stderr
+            score = None
+            for line in output.splitlines():
+                if "Fragmentation score" in line:
+                    # ejemplo: Fragmentation score : 12
+                    try:
+                        score_str = line.split(":")[1].strip().split()[0]
+                        score = float(score_str)
+                        break
+                    except Exception:
+                        continue
+
+            if score is not None:
+                # Normalizar a 0-1 asumiendo 0-100 como rango típico
+                normalized = max(0.0, min(score / 100.0, 1.0))
+            else:
+                normalized = None
+        except (FileNotFoundError, subprocess.SubprocessError):
+            normalized = None
+
+        self._disk_frag_cache[mountpoint] = {"ts": now, "value": normalized}
+        return normalized

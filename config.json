@@ -1,0 +1,24 @@
+{
+  "update_interval": 1.0,
+  "history_duration": 3600,
+  "process_refresh_interval": 4.0,
+  "process_list_limit": 40,
+  "use_pkexec": true,
+  "alerts": {
+    "cpu_warn": 85.0,
+    "cpu_crit": 95.0,
+    "ram_warn": 85.0,
+    "ram_crit": 95.0
+  },
+  "theme": "light",
+  "rgb_enabled": false,
+  "power_profiles": {
+    "Silencioso": { "governor": "powersave" },
+    "Equilibrado": { "governor": "powersave" },
+    "Rendimiento": { "governor": "performance" }
+  },
+  "profiles": {
+    "juego": { "governor": "performance" },
+    "bajo_consumo": { "governor": "powersave" }
+  }
+}

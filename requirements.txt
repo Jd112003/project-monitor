@@ -2,3 +2,4 @@
 # Sistema de monitoreo de recursos del sistema
 
 psutil>=5.9.0
+PySide6>=6.6
